@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from cassetter import Cassette
 
 with try_import() as imports_successful:
-    from anthropic import AsyncAnthropicBedrock, AsyncAnthropicFoundry
+    from anthropic import DEFAULT_TIMEOUT, AsyncAnthropicBedrock, AsyncAnthropicFoundry
     from anthropic.types.beta import BetaTextBlock, BetaToolUseBlock, BetaUsage
 
     from pydantic_ai.models import ModelRequestParameters
@@ -146,7 +146,7 @@ def message_history_with_paired_instruction() -> list[ModelMessage]:
 
     The pairing is what puts a native `system` entry directly behind the request's own user turn.
     Without one, the entry gets the `.` anchor instead (see `..._without_user_turn`), so these are
-    the histories where `_place_system_messages_before_generation` decides where it ends up.
+    the histories where `place_system_messages_before_generation` decides where it ends up.
     """
     history = message_history()
     history[-1] = ModelRequest(
@@ -686,6 +686,7 @@ async def test_mid_conversation_system_prompt_on_foundry(allow_model_requests: N
     # below is then the shared one from `Model.prepare_messages` that every model without support
     # gets — the adapter has no `<system>` rendering of its own.
     foundry_client = MagicMock(spec=AsyncAnthropicFoundry)
+    foundry_client.timeout = DEFAULT_TIMEOUT
     foundry_client.base_url = 'https://example.services.ai.azure.com/anthropic'
     foundry_client.beta.messages.create = AsyncMock(return_value=completion)
 
@@ -1061,7 +1062,7 @@ def test_a_sliding_entry_leaves_its_cache_boundary_behind():
 def test_an_entry_a_later_instruction_follows_keeps_its_cache_boundary():
     """A `system` entry behind another doesn't slide, so its boundary is still exactly representable.
 
-    `_place_system_messages_before_generation` only hops *user* turns, and a second instruction isn't
+    `place_system_messages_before_generation` only hops *user* turns, and a second instruction isn't
     one. Nothing moves, so nothing has to be given up: the boundary stays on the entry that carries it.
     """
     assert _map(

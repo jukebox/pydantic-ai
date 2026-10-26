@@ -30,14 +30,20 @@ __all__ = ('SSHWorkspaceBackend',)
 # The remote wrapper script reports on stderr that it reached the working directory, and then whether
 # the directory outlived the command. Without them, ssh's own failures (exit 255) look like results.
 _READY = '__pydantic_ai_ssh_ready__\n'
-_DONE = re.compile(r'\n__pydantic_ai_ssh_done__(\d+)\n')
-"""Carries the command's exit status: `ssh` itself exits 255 when the connection fails, which a command can too."""
 _GONE = '\n__pydantic_ai_ssh_gone__\n'
 
 _JOB_TAG = '__pydantic_ai_ssh_job_'
-"""Starts every remote script, followed by a random suffix, so a later connection can find the command's processes."""
+"""Followed by a random suffix, it is the argument of every remote `sh`, so a later connection can find the command's processes."""
 
-_STOP = r"""me=$(ps -o pgid= -p $$ | tr -d ' ')
+_SCRIPT_CHUNK = 16_384
+"""Characters of the remote script per argument of the local `printf` that feeds it to `ssh`.
+
+At most 4 bytes each in UTF-8, so well under Linux's 128 KiB limit on one argument.
+"""
+
+_STOP = r"""PATH=/usr/bin:/bin
+export PATH
+me=$(ps -o pgid= -p $$ | tr -d ' ')
 groups=$(ps -A -o pgid=,args= | grep -F -e "$1" | awk -v me="$me" '$1 != me { print $1 }' | sort -u)
 [ -n "$groups" ] || exit 0
 for group in $groups; do kill -s TERM -- "-$group" 2> /dev/null; done
@@ -50,6 +56,10 @@ that started a session of its own (the harness `Shell`'s jobs) is in another gro
 `kill -s SIG --` is the form every POSIX shell's `kill` accepts; dash rejects `kill -TERM -- -<group>`.
 The `SIGKILL` for groups that outlast `SIGTERM` comes a second later in the background, with its output
 closed so `sshd` doesn't wait for it, so a stop costs one round trip.
+
+It runs on the host, outside any sandbox wrapping this backend, so `ps`, `grep` and the rest come from the
+system directories only: the login `PATH` can hold a directory the stopped command could write to, such as
+`~/.local/bin` under a working directory that contains the home directory.
 """
 
 _STOP_TIMEOUT = 2.0
@@ -67,6 +77,12 @@ _CLIENT_ENV = ('SSH_AUTH_SOCK',)
 
 def _after_ready(stderr: str) -> str:
     return stderr.partition(_READY)[2]
+
+
+def _not_started(timeout: float) -> WorkspaceTimeoutError:
+    return WorkspaceTimeoutError(
+        f'command timed out after {timeout:g}s while connecting and was not started', stdout='', stderr=''
+    )
 
 
 class SSHWorkspaceBackend(WorkspaceBackend, SupportsCommands):
@@ -112,6 +128,8 @@ class SSHWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         # askpass helper. `BatchMode=yes` comes first so it wins over `ssh_args`, and keys or
         # `ssh-agent` (via `SSH_AUTH_SOCK`) authenticate instead.
         self._ssh = ['ssh', '-T', '-o', 'BatchMode=yes', *ssh_args, '--', destination]
+        # Until `ssh` turns out not to forward its input, which `-n`, `-f` and `StdinNull` stop.
+        self._script_on_stdin = True
         # A local subprocess runner: it owns timeouts, output limits and killing `ssh` on cancellation.
         self._runner = LocalWorkspaceBackend(
             '/', env={name: os.environ[name] for name in _CLIENT_ENV if name in os.environ}
@@ -155,7 +173,7 @@ class SSHWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         if isinstance(command, str):
             if not shell:
                 raise TypeError('a string command requires shell=True; pass an argv sequence otherwise')
-            line = f'sh -c {shlex.quote(command)}'
+            line = f'/bin/sh -c {shlex.quote(command)}'
         elif shell:
             raise TypeError('an argv sequence cannot be combined with shell=True; pass a single command string')
         elif not command:
@@ -170,9 +188,7 @@ class SSHWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         if timeout is not None:
             remaining = timeout - (anyio.current_time() - started)
             if remaining <= 0:
-                raise WorkspaceTimeoutError(
-                    f'command timed out after {timeout:g}s while connecting and was not started', stdout='', stderr=''
-                )
+                raise _not_started(timeout)
             timeout = remaining
         return await self._remote(directory, line, env=merged_env, timeout=timeout)
 
@@ -181,20 +197,38 @@ class SSHWorkspaceBackend(WorkspaceBackend, SupportsCommands):
     ) -> CommandResult:
         exports = ''.join(f'export {name}={shlex.quote(value)}\n' for name, value in env.items())
         tag = f'{_JOB_TAG}{secrets.token_hex(8)}'
+        # A fresh nonce per command: the marker text is otherwise a constant a child of the command can print.
+        nonce = secrets.token_hex(16)
+        marker = f'__pydantic_ai_ssh_done_{nonce}__'
+        # The shell parses a `{ ...; }` group whole before running it, so the script has been read when the
+        # command starts, and the command's stdin is at EOF like a local one's rather than the script's rest.
         script = (
-            f': {tag}\n'
+            '{\n'
             f'cd {shlex.quote(directory)} || exit 1\n'
             # On both streams, so output from `~/.ssh/rc` or a login banner is cut off.
             f"printf '%s' {shlex.quote(_READY)}; printf '%s' {shlex.quote(_READY)} >&2\n"
             f'{exports}__pydantic_ai_dir=$PWD\n'
             f'{line}\n'
             '__pydantic_ai_status=$?\n'
-            'if [ -d "$__pydantic_ai_dir" ]; then printf \'\\n__pydantic_ai_ssh_done__%d\\n\' "$__pydantic_ai_status" >&2; '
+            f'if [ -d "$__pydantic_ai_dir" ]; then printf \'\\n{marker}%d\\n\' "$__pydantic_ai_status" >&2; '
             f"else printf '%s' {shlex.quote(_GONE)} >&2; fi\n"
-            'exit "$__pydantic_ai_status"'
+            'exit "$__pydantic_ai_status"\n'
+            '} < /dev/null\n'
         )
-        # `ssh` hands the command to the remote login shell, so run `sh` there for POSIX semantics.
-        argv = [*self._ssh, f'sh -c {shlex.quote(script)}']
+        # `ssh` hands the command to the remote login shell. `/bin/sh` is absolute so a writable `PATH` entry
+        # cannot supply the shell that interprets this script. Either way the tag is an argument of that `sh`.
+        # The mode is read once: a concurrent command can switch it while this one waits on `ssh`.
+        on_stdin = self._script_on_stdin
+        if on_stdin:
+            # The script reaches the remote `sh` on stdin, so the remote command line stays short whatever the
+            # command's size: as an argument, its quoted form could pass the operating system's limit on one, on
+            # either host. A local `printf` builtin feeds it, in arguments small enough for any host.
+            ssh = shlex.join([*self._ssh, f'/bin/sh -s {tag}'])
+            chunks = [script[start : start + _SCRIPT_CHUNK] for start in range(0, len(script), _SCRIPT_CHUNK)]
+            argv = ['/bin/sh', '-c', f'printf %s "$@" | {ssh}', 'sh', *chunks]
+        else:
+            argv = [*self._ssh, f'/bin/sh -c {shlex.quote(script)} {tag}']
+        started = anyio.current_time()
         try:
             result = await self._runner.run(argv, timeout=timeout)
         except anyio.get_cancelled_exc_class():
@@ -216,19 +250,32 @@ class SSHWorkspaceBackend(WorkspaceBackend, SupportsCommands):
             ) from error
         before, ready, stderr = result.stderr.partition(_READY)
         if not ready:
+            if result.exit_code == 0 and on_stdin:
+                # A script that runs prints the marker or exits 1, so the remote `sh` read none and nothing ran:
+                # `-n`, `-f` and `StdinNull` give `ssh` an empty input. From now on the script goes on the remote
+                # command line, which caps how long a command can be, within the time this attempt left.
+                self._script_on_stdin = False
+                if timeout is not None:
+                    remaining = timeout - (anyio.current_time() - started)
+                    if remaining <= 0:
+                        raise _not_started(timeout)
+                    timeout = remaining
+                return await self._remote(directory, line, env=env, timeout=timeout)
             reason = before.strip() or f'`ssh` exited with code {result.exit_code}'
             raise WorkspaceUnavailableError(f'SSH workspace {self._ref.id} is unavailable: {reason}')
-        # A background child that kept stderr open can write after the marker, so take the last one, not the end.
-        markers = list(_DONE.finditer(stderr))
+        # The marker carries the status because `ssh` uses exit 255 for a lost connection, and a command can too.
+        # Any other process exit is the command's: a child can print a marker after the wrapper has written its own.
+        pattern = re.compile(rf'\n{re.escape(marker)}(\d+)\n')
+        markers = list(pattern.finditer(stderr))
         if not markers:
             if _GONE in stderr:
                 raise WorkspaceUnavailableError(f'SSH workspace {self._ref.id}: the working directory was removed')
             raise WorkspaceUnavailableError(f'SSH workspace {self._ref.id}: the connection was lost during the command')
-        done = markers[-1]
+        status = result.exit_code if result.exit_code != 255 else int(markers[0][1])
         return CommandResult(
-            exit_code=int(done[1]),
+            exit_code=status,
             stdout=_after_ready(result.stdout),
-            stderr=stderr[: done.start()] + stderr[done.end() :],
+            stderr=pattern.sub('', stderr),
         )
 
     async def _stop(self, tag: str) -> None:
@@ -236,6 +283,8 @@ class SSHWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         # Best effort: a host that stalls or can't be reached now has nothing to report.
         with anyio.CancelScope(shield=True):
             try:
-                await self._runner.run([*self._ssh, f'sh -c {shlex.quote(_STOP)} sh {tag}'], timeout=_STOP_TIMEOUT)
+                await self._runner.run(
+                    [*self._ssh, f'/bin/sh -c {shlex.quote(_STOP)} /bin/sh {tag}'], timeout=_STOP_TIMEOUT
+                )
             except WorkspaceError:
                 pass
