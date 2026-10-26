@@ -142,8 +142,8 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     `{'timezone': 'Europe/Paris'}` alone keeps the clock on `os_access` but makes `astimezone()`,
     `%Z`, and `time.tzname` report that zone. See `pydantic_monty.OSPolicy` for every key.
 
-    Inside a Temporal workflow, a `'system'` clock or randomness is read again on replay; keep the
-    default or a fixed value there.
+    Inside a Temporal workflow, a `'system'` clock or `random_start` is read again on replay; keep
+    the defaults (or fixed values) there.
     """
 
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
