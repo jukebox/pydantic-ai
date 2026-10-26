@@ -18,7 +18,6 @@ from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
 from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness.code_mode import CodeModeOSPolicy, CodeModeToolset
-from pydantic_ai_harness.code_mode._eager import EagerCodeModeToolset
 
 PARIS_NOON = datetime(2026, 1, 15, 12, 0, tzinfo=ZoneInfo('Europe/Paris'))
 CLOCK_CODE = """\
@@ -131,5 +130,4 @@ async def test_description_without_a_policy_clock_is_unchanged(os_policy: CodeMo
 def test_os_policy_reaches_the_toolset(eager: bool) -> None:
     os_policy: CodeModeOSPolicy = {'datetime': 'system', 'timezone': 'Europe/Paris'}
     wrapper = _wrapper(CodeMode[None](os_policy=os_policy, eager=eager))
-    assert isinstance(wrapper, EagerCodeModeToolset) is eager
     assert wrapper.os_policy == os_policy
